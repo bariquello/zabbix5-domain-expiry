@@ -72,8 +72,8 @@ sudo dnf install -y whois jq curl gawk
 
 ```bash
 # Clone ou baixe o repositorio
-git clone https://github.com/SEU-USUARIO/zabbix-domain-expiry.git
-cd zabbix-domain-expiry
+git clone https://github.com/bariquello/zabbix5-domain-expiry.git
+cd zabbix5-domain-expiry
 
 # Copie o script para o diretorio de ExternalScripts
 sudo cp check_domain.sh /usr/lib/zabbix/externalscripts/
