@@ -359,8 +359,6 @@ zabbix-domain-expiry/
 ├── check_domain.sh                    # Script de monitoramento
 ├── importar_dominios_zabbix_v5.py     # Script de importacao em massa
 ├── dominios.csv                       # CSV de exemplo (opcional)
-└── templates/
-    └── zbx_domain_expiry_v5.xml       # Template XML (opcional)
 ```
 
 ---
