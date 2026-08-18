@@ -1,0 +1,1 @@
+# zabbix5-domain-expiry
