@@ -1,230 +1,182 @@
 #!/bin/bash
-#
-# check_domain.sh - Monitor domain expiration dates using RDAP or WHOIS protocols
-# Versao corrigida para Zabbix 5.0
-#
-# Usage: check_domain.sh <domain>
-# Example: check_domain.sh example.com
-#
-# Output: JSON {"state":"OK","days_left":365,"expire_date":"2027-08-18"}
-#
 
-set -euo pipefail
+set -uo pipefail
 
-# Configuration
-TIMEOUT_RDAP=${TIMEOUT_RDAP:-5}
-TIMEOUT_WHOIS=${TIMEOUT_WHOIS:-10}
-EXPIRY_WARNING_DAYS=${EXPIRY_WARNING_DAYS:-30}
-EXPIRY_CRITICAL_DAYS=${EXPIRY_CRITICAL_DAYS:-7}
+DOMAIN="${1:-}"
 
-# Logging
-log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >&2
-}
+if [ -z "$DOMAIN" ]; then
+    echo '{"state":"ERROR","message":"No domain specified"}'
+    exit 1
+fi
 
-# Get RDAP bootstrap URL for TLD
-get_rdap_bootstrap() {
-    local tld="${1}"
-    local bootstrap_url="https://rdap.org/bootstrap/domain/${tld}"
-    
-    curl -s --max-time "${TIMEOUT_RDAP}" "${bootstrap_url}" 2>/dev/null || echo ""
-}
+# Validacao simples de formato de dominio
+if ! [[ "$DOMAIN" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+    echo "{\"state\":\"ERROR\",\"message\":\"Invalid domain format: $DOMAIN\"}"
+    exit 1
+fi
 
-# Get RDAP service URL from bootstrap
-get_rdap_service() {
-    local bootstrap_data="${1}"
-    local tld="${2}"
-    
-    # Try to extract RDAP service URL from bootstrap JSON
-    local rdap_url
-    rdap_url=$(echo "${bootstrap_data}" | jq -r '.services[] | select(.[] | test("'"${tld}"'$")) | .[0]' 2>/dev/null | head -1)
-    
-    if [[ -n "${rdap_url}" ]]; then
-        echo "${rdap_url}"
+# --------------------------------------------------------------------
+# Normaliza qualquer formato de data para YYYY-MM-DD
+# Suporta:
+#   ISO 8601      -> 2027-04-02T13:58:50Z
+#   YYYY-MM-DD    -> 2026-11-25
+#   YYYYMMDD      -> 20261125          (Registro.br)
+#   DD/MM/YYYY    -> 25/11/2026
+#   DD.MM.YYYY    -> 25.11.2026
+# --------------------------------------------------------------------
+normalize_date() {
+
+    local RAW
+    RAW=$(echo "$1" | tr -d '\r' | awk '{$1=$1; print}')
+
+    [ -z "$RAW" ] && return 1
+
+    local NORM=""
+
+    if [[ "$RAW" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+        # ISO ou YYYY-MM-DD
+        NORM="${RAW:0:10}"
+
+    elif [[ "$RAW" =~ ^[0-9]{8}$ ]]; then
+        # YYYYMMDD (Registro.br)
+        NORM="${RAW:0:4}-${RAW:4:2}-${RAW:6:2}"
+
+    elif [[ "$RAW" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4}) ]]; then
+        # DD/MM/YYYY
+        NORM="${BASH_REMATCH[3]}-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}"
+
+    elif [[ "$RAW" =~ ^([0-9]{2})\.([0-9]{2})\.([0-9]{4}) ]]; then
+        # DD.MM.YYYY
+        NORM="${BASH_REMATCH[3]}-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}"
+
     else
-        # Fallback to default RDAP URL
-        echo "https://rdap.org/domain/${tld}"
+        # Ultima tentativa: deixar o date interpretar
+        NORM=$(date -d "$RAW" '+%Y-%m-%d' 2>/dev/null)
     fi
+
+    # Valida se o resultado e uma data reconhecivel
+    date -d "$NORM" '+%Y-%m-%d' 2>/dev/null
 }
 
-# Query RDAP for domain expiration
-query_rdap() {
-    local domain="${1}"
-    local rdap_url="${2}"
-    
-    local rdap_data
-    rdap_data=$(curl -s --max-time "${TIMEOUT_RDAP}" \
+# --------------------------------------------------------------------
+# RDAP - fonte primaria
+# --------------------------------------------------------------------
+get_rdap_expiry() {
+
+    local DOMAIN="$1"
+
+    curl -sL \
         -H "Accept: application/rdap+json" \
-        "${rdap_url}/${domain}" 2>/dev/null) || return 1
-    
-    # Extract expiration date
-    local expiry_date
-    expiry_date=$(echo "${rdap_data}" | jq -r '.events[] | select(.eventAction=="expiration") | .eventDate' 2>/dev/null | head -1)
-    
-    if [[ -n "${expiry_date}" && "${expiry_date}" != "null" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    # Try alternative JSON structure
-    expiry_date=$(echo "${rdap_data}" | jq -r '.entities[] | select(.roles[] | test("registrar")) | .events[] | select(.eventAction=="expiration") | .eventDate' 2>/dev/null | head -1)
-    
-    if [[ -n "${expiry_date}" && "${expiry_date}" != "null" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    return 1
+        --connect-timeout 10 \
+        --max-time 20 \
+        "https://rdap.org/domain/${DOMAIN}" \
+    | jq -r '
+        .events[]? |
+        select(
+            .eventAction=="expiration"
+            or .eventAction=="expiry"
+            or .eventAction=="expire"
+        ) |
+        .eventDate
+    ' 2>/dev/null | head -1
 }
 
-# Query WHOIS for domain expiration
-query_whois() {
-    local domain="${1}"
-    
-    local whois_data
-    whois_data=$(timeout "${TIMEOUT_WHOIS}" whois "${domain}" 2>/dev/null) || return 1
-    
-    # Try to extract expiration date from various WHOIS formats
-    local expiry_date
-    
-    # Format: Registry Expiry Date: YYYY-MM-DD
-    expiry_date=$(echo "${whois_data}" | grep -i "Registry Expiry Date:" | awk '{print $4}' | head -1)
-    
-    if [[ -n "${expiry_date}" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    # Format: expire-date: YYYY-MM-DD
-    expiry_date=$(echo "${whois_data}" | grep -i "expire-date:" | awk '{print $2}' | head -1)
-    
-    if [[ -n "${expiry_date}" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    # Format: Expiry Date: DD/MM/YYYY
-    expiry_date=$(echo "${whois_data}" | grep -i "Expiry Date:" | awk '{print $3}' | head -1)
-    
-    if [[ -n "${expiry_date}" ]]; then
-        # Convert DD/MM/YYYY to YYYY-MM-DD
-        local day month year
-        day=$(echo "${expiry_date}" | cut -d'/' -f1)
-        month=$(echo "${expiry_date}" | cut -d'/' -f2)
-        year=$(echo "${expiry_date}" | cut -d'/' -f3)
-        echo "${year}-${month}-${day}"
-        return 0
-    fi
-    
-    # Format: expires: YYYY-MM-DD
-    expiry_date=$(echo "${whois_data}" | grep -i "^expires:" | awk '{print $2}' | head -1)
-    
-    if [[ -n "${expiry_date}" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    # Format: Expiration Date: YYYY-MM-DD
-    expiry_date=$(echo "${whois_data}" | grep -i "Expiration Date:" | awk '{print $3}' | head -1)
-    
-    if [[ -n "${expiry_date}" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    # Format: paid-till: YYYY-MM-DD (RU domains)
-    expiry_date=$(echo "${whois_data}" | grep -i "paid-till:" | awk '{print $2}' | head -1)
-    
-    if [[ -n "${expiry_date}" ]]; then
-        echo "${expiry_date}"
-        return 0
-    fi
-    
-    return 1
+# --------------------------------------------------------------------
+# WHOIS - fallback
+# Alguns TLDs precisam de servidor WHOIS especifico porque o cliente
+# do Debian usa referencias antigas que nao resolvem mais em DNS.
+# --------------------------------------------------------------------
+get_whois_expiry() {
+
+    local DOMAIN="$1"
+    local TLD="${DOMAIN##*.}"
+    local WHOIS_OUTPUT=""
+
+    case "$TLD" in
+        vc)
+            # TLD .vc e operado pela Identity Digital
+            WHOIS_OUTPUT=$(timeout 20 whois -h whois.identitydigital.services "$DOMAIN" 2>/dev/null)
+            ;;
+        br)
+            # TLD .br e operado pelo Registro.br
+            WHOIS_OUTPUT=$(timeout 20 whois -h whois.registro.br "$DOMAIN" 2>/dev/null)
+            ;;
+        *)
+            WHOIS_OUTPUT=$(timeout 20 whois "$DOMAIN" 2>/dev/null)
+            ;;
+    esac
+
+    echo "$WHOIS_OUTPUT" | grep -iE \
+        'Registry Expiry Date:|Registrar Registration Expiration Date:|Expiration Date:|Expiry Date:|expire-date:|^expires:|paid-till:' \
+        | head -1 \
+        | sed -E 's/^[^:]+:[[:space:]]*//' \
+        | tr -d '\r' \
+        | awk '{$1=$1; print}'
 }
 
-# Calculate days until expiration
-calculate_days_left() {
-    local expiry_date="${1}"
-    
-    local expiry_epoch current_epoch days_left
-    expiry_epoch=$(date -d "${expiry_date}" +%s 2>/dev/null) || return 1
-    current_epoch=$(date +%s)
-    
-    days_left=$(( (expiry_epoch - current_epoch) / 86400 ))
-    
-    echo "${days_left}"
+# --------------------------------------------------------------------
+# Calculo de dias restantes
+# --------------------------------------------------------------------
+calculate_days() {
+
+    local DATE="$1"
+
+    EXPIRY=$(date -d "$DATE 12:00:00" +%s 2>/dev/null)
+
+    if [ -z "$EXPIRY" ]; then
+        return 1
+    fi
+
+    NOW=$(date -d "$(date +%Y-%m-%d) 12:00:00" +%s 2>/dev/null)
+
+    echo $(( (EXPIRY - NOW) / 86400 ))
 }
 
-# Main function
-main() {
-    # CORRECAO: Usar variavel de ambiente ou parametro posicional
-    local DOMAIN_NAME="${1:-}"
-    
-    # Se nao recebeu parametro, tentar ZABBIX_MACRO ou falhar
-    if [[ -z "${DOMAIN_NAME}" ]]; then
-        echo '{"state":"ERROR","message":"No domain specified"}'
-        exit 1
-    fi
-    
-    # Validate domain format
-    if ! [[ "${DOMAIN_NAME}" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo '{"state":"ERROR","message":"Invalid domain format"}'
-        exit 1
-    fi
-    
-    # Extract TLD
-    local tld
-    tld=$(echo "${DOMAIN_NAME}" | rev | cut -d'.' -f1 | rev)
-    
-    # Try RDAP first
-    local expiry_date=""
-    
-    # Get RDAP bootstrap
-    local bootstrap_data
-    bootstrap_data=$(get_rdap_bootstrap "${tld}")
-    
-    if [[ -n "${bootstrap_data}" ]]; then
-        local rdap_service
-        rdap_service=$(get_rdap_service "${bootstrap_data}" "${tld}")
-        
-        if [[ -n "${rdap_service}" ]]; then
-            expiry_date=$(query_rdap "${DOMAIN_NAME}" "${rdap_service}") || expiry_date=""
-        fi
-    fi
-    
-    # Fallback to WHOIS
-    if [[ -z "${expiry_date}" ]]; then
-        expiry_date=$(query_whois "${DOMAIN_NAME}") || expiry_date=""
-    fi
-    
-    # Check if we got an expiration date
-    if [[ -z "${expiry_date}" ]]; then
-        echo '{"state":"ERROR","message":"Could not retrieve expiration date"}'
-        exit 1
-    fi
-    
-    # Calculate days left
-    local days_left
-    days_left=$(calculate_days_left "${expiry_date}") || {
-        echo '{"state":"ERROR","message":"Could not calculate days left"}'
-        exit 1
-    }
-    
-    # Determine state
-    local state="OK"
-    if [[ ${days_left} -lt 0 ]]; then
-        state="EXPIRED"
-    elif [[ ${days_left} -lt ${EXPIRY_CRITICAL_DAYS} ]]; then
-        state="CRITICAL"
-    elif [[ ${days_left} -lt ${EXPIRY_WARNING_DAYS} ]]; then
-        state="WARNING"
-    fi
-    
-    # Output JSON
-    printf '{"state":"%s","days_left":%d,"expire_date":"%s"}\n' \
-        "${state}" "${days_left}" "${expiry_date}"
-}
+# --------------------------------------------------------------------
+# Fluxo principal
+# --------------------------------------------------------------------
+EXPIRY=""
+SOURCE=""
 
-# Execute main function with all arguments
-main "$@"
+# Primeiro tenta RDAP
+EXPIRY=$(get_rdap_expiry "$DOMAIN")
+
+if [ -n "$EXPIRY" ]; then
+    SOURCE="RDAP"
+else
+    # Se RDAP falhar tenta WHOIS
+    EXPIRY=$(get_whois_expiry "$DOMAIN")
+    SOURCE="WHOIS"
+fi
+
+if [ -z "$EXPIRY" ]; then
+    echo "{\"state\":\"ERROR\",\"message\":\"Could not retrieve expiration date\",\"domain\":\"$DOMAIN\"}"
+    exit 1
+fi
+
+# Normaliza a data para YYYY-MM-DD
+EXPIRY_DATE=$(normalize_date "$EXPIRY")
+
+if [ -z "$EXPIRY_DATE" ]; then
+    echo "{\"state\":\"ERROR\",\"message\":\"Could not parse expiration date\",\"raw\":\"$EXPIRY\",\"domain\":\"$DOMAIN\"}"
+    exit 1
+fi
+
+DAYS_LEFT=$(calculate_days "$EXPIRY_DATE")
+
+if [ -z "$DAYS_LEFT" ]; then
+    echo "{\"state\":\"ERROR\",\"message\":\"Could not calculate days\",\"expire_date\":\"$EXPIRY_DATE\"}"
+    exit 1
+fi
+
+STATE="OK"
+
+if [ "$DAYS_LEFT" -lt 0 ]; then
+    STATE="EXPIRED"
+elif [ "$DAYS_LEFT" -lt 7 ]; then
+    STATE="CRITICAL"
+elif [ "$DAYS_LEFT" -lt 30 ]; then
+    STATE="WARNING"
+fi
+
+echo "{\"state\":\"$STATE\",\"days_left\":$DAYS_LEFT,\"expire_date\":\"$EXPIRY_DATE\",\"source\":\"$SOURCE\"}"
